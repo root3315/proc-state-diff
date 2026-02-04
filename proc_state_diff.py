@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+DEFAULT_HISTORY_FILE = ".proc_state_diff_history.json"
+
+
 def capture_snapshot():
     """Capture the current process state using ps aux."""
     try:
@@ -209,6 +212,21 @@ def format_report(report, verbose=False, color=True):
     return "\n".join(lines)
 
 
+def load_history(history_file):
+    """Load the change history from a JSON file."""
+    path = Path(history_file)
+    if not path.exists():
+        return {"runs": []}
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_history(history, history_file):
+    """Save the change history to a JSON file."""
+    with open(history_file, "w") as f:
+        json.dump(history, f, indent=2)
+
+
 def cmd_capture(args):
     """Handle the 'capture' subcommand."""
     snapshot = capture_snapshot()
@@ -236,6 +254,105 @@ def cmd_diff(args):
         json_path = args.json
         save_snapshot(report, json_path)
         print(f"JSON report saved to {json_path}")
+
+
+def cmd_track(args):
+    """Handle the 'track' subcommand: capture and auto-compare against previous snapshot."""
+    history_file = args.history if args.history else DEFAULT_HISTORY_FILE
+    history = load_history(history_file)
+
+    new_snap = capture_snapshot()
+
+    if history["runs"]:
+        last_run = history["runs"][-1]
+        old_snap = last_run.get("snapshot")
+        if old_snap is None:
+            print("ERROR: Previous snapshot data missing from history. Cannot compare.", file=sys.stderr)
+            sys.exit(1)
+
+        report = compare_snapshots(
+            old_snap, new_snap,
+            ignore_cpu=args.ignore_cpu,
+            ignore_mem=args.ignore_mem,
+        )
+        output = format_report(report, verbose=args.verbose, color=not args.no_color)
+        print(output)
+
+        run_entry = {
+            "timestamp": new_snap["timestamp"],
+            "hostname": new_snap["hostname"],
+            "process_count": new_snap["process_count"],
+            "summary": report["summary"],
+        }
+        if args.keep_snapshots:
+            run_entry["snapshot"] = new_snap
+        if args.output:
+            snap_path = save_snapshot(new_snap, args.output)
+            run_entry["snapshot_file"] = str(snap_path)
+    else:
+        print(f"Captured {new_snap['process_count']} processes (baseline run).")
+        print(f"  Timestamp: {new_snap['timestamp']}")
+        print(f"  Hostname:  {new_snap['hostname']}")
+        print("Run again to see a comparison.")
+
+        run_entry = {
+            "timestamp": new_snap["timestamp"],
+            "hostname": new_snap["hostname"],
+            "process_count": new_snap["process_count"],
+            "summary": None,
+        }
+        if args.keep_snapshots:
+            run_entry["snapshot"] = new_snap
+        if args.output:
+            snap_path = save_snapshot(new_snap, args.output)
+            run_entry["snapshot_file"] = str(snap_path)
+
+    history["runs"].append(run_entry)
+
+    if args.max_history and len(history["runs"]) > args.max_history:
+        history["runs"] = history["runs"][-args.max_history:]
+
+    save_history(history, history_file)
+    print(f"  History updated -> {history_file}")
+
+
+def cmd_history(args):
+    """Handle the 'history' subcommand: view tracked change history."""
+    history_file = args.history if args.history else DEFAULT_HISTORY_FILE
+    history = load_history(history_file)
+
+    if not history["runs"]:
+        print("No tracked runs found.")
+        return
+
+    runs = history["runs"]
+    if args.last:
+        runs = runs[-args.last:]
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append("PROCESS STATE CHANGE HISTORY")
+    lines.append("=" * 70)
+
+    for i, run in enumerate(runs):
+        lines.append("")
+        ts = run.get("timestamp", "unknown")
+        host = run.get("hostname", "unknown")
+        count = run.get("process_count", "?")
+        lines.append(f"  Run {i + 1}: {ts}  (host: {host}, processes: {count})")
+
+        summary = run.get("summary")
+        if summary:
+            lines.append(f"    Added: {summary['added_count']}  |  Removed: {summary['removed_count']}  |  Changed: {summary['changed_count']}")
+        else:
+            lines.append("    (baseline — no comparison)")
+
+        snap_file = run.get("snapshot_file")
+        if snap_file:
+            lines.append(f"    Snapshot file: {snap_file}")
+
+    lines.append("")
+    print("\n".join(lines))
 
 
 def cmd_list_snapshots(args):
@@ -286,6 +403,24 @@ def main():
     diff_parser.add_argument("--no-color", action="store_true", help="Disable color output")
     diff_parser.add_argument("--json", metavar="FILE", help="Also save the diff report as JSON")
     diff_parser.set_defaults(func=cmd_diff)
+
+    # track
+    track_parser = subparsers.add_parser("track", help="Capture and auto-compare against previous snapshot")
+    track_parser.add_argument("-o", "--output", help="Save snapshot to this file path")
+    track_parser.add_argument("--history", help=f"History file path (default: {DEFAULT_HISTORY_FILE})")
+    track_parser.add_argument("-v", "--verbose", action="store_true", help="Show all changed fields")
+    track_parser.add_argument("--ignore-cpu", action="store_true", help="Ignore CPU changes")
+    track_parser.add_argument("--ignore-mem", action="store_true", help="Ignore memory changes")
+    track_parser.add_argument("--no-color", action="store_true", help="Disable color output")
+    track_parser.add_argument("--keep-snapshots", action="store_true", help="Keep full snapshot data in history file")
+    track_parser.add_argument("--max-history", type=int, default=50, help="Maximum number of runs to keep (default: 50)")
+    track_parser.set_defaults(func=cmd_track)
+
+    # history
+    hist_parser = subparsers.add_parser("history", help="View tracked change history")
+    hist_parser.add_argument("--history", help=f"History file path (default: {DEFAULT_HISTORY_FILE})")
+    hist_parser.add_argument("--last", type=int, help="Show only the last N runs")
+    hist_parser.set_defaults(func=cmd_history)
 
     # list
     list_parser = subparsers.add_parser("list", help="List snapshot files in a directory")
